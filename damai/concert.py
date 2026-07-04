@@ -8,12 +8,16 @@ __Created__ = 2023/10/10 17:00
 
 import os.path
 import pickle
+import re
 import time
 from time import sleep
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from check_environment import get_chromedriver_path
+try:
+    from .check_environment import get_chromedriver_path
+except ImportError:
+    from check_environment import get_chromedriver_path
 
 
 class Concert:
@@ -40,6 +44,14 @@ class Concert:
         service = Service(chromedriver_path)
         self.driver = webdriver.Chrome(service=service, options=chrome_options)  # 默认Chrome浏览器
 
+    def _get_max_retries(self):
+        """读取最大轮询次数，配置为 0 或负数时表示不限制。"""
+        try:
+            max_retries = int(self.config.max_retries)
+        except (TypeError, ValueError):
+            return 1000
+        return None if max_retries <= 0 else max_retries
+
     def set_cookie(self):
         """
         :return: 写入cookie
@@ -65,16 +77,26 @@ class Concert:
         """
         try:
             cookies = pickle.load(open("damai_cookies.pkl", "rb"))
+            loaded = 0
             for cookie in cookies:
+                name = cookie.get('name')
+                value = cookie.get('value')
+                if not name or value is None:
+                    continue
                 cookie_dict = {
                     'domain': '.damai.cn',  # 域为大麦网的才为有效cookie
-                    'name': cookie.get('name'),
-                    'value': cookie.get('value'),
+                    'name': name,
+                    'value': value,
                 }
                 self.driver.add_cookie(cookie_dict)
-            print('***完成cookie加载***\n')
+                loaded += 1
+            print(f'***完成cookie加载: {loaded} 条***\n')
+            self.driver.get(self.config.target_url)
         except Exception as e:
-            print(e)
+            print(f'***Cookie加载失败，将重新扫码登录: {e}***\n')
+            if os.path.exists('damai_cookies.pkl'):
+                os.remove('damai_cookies.pkl')
+            self.set_cookie()
 
     def login(self):
         """
@@ -88,7 +110,7 @@ class Concert:
                 # 没有cookie就获取
                 self.set_cookie()
             else:
-                self.driver.get(self.config.target_url)
+                self.driver.get(self.config.index_url)
                 self.get_cookie()
 
     def enter_concert(self):
@@ -143,6 +165,127 @@ class Concert:
             return 0.1 if self.config.fast_mode else 0.2
         return 0.2 if self.config.fast_mode else 0.3
 
+    def _get_timing(self, name, default, min_value=0.05):
+        """读取可配置时间参数，并避免过低间隔造成浏览器空转。"""
+        try:
+            value = float(getattr(self.config, name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(value, min_value)
+
+    def _get_purchase_button_texts(self):
+        """详情页进入购买/选座流程的按钮文案候选。"""
+        return [
+            "立即购票",
+            "立即购买",
+            "立即预订",
+            "立即抢票",
+            "立即抢购",
+            "立即订购",
+            "马上抢",
+            "马上抢票",
+            "马上购买",
+            "去购买",
+            "去购票",
+            "去抢票",
+            "去预订",
+            "立即下单",
+            "去下单",
+            "选座购买",
+            "立即选座",
+            "去选座",
+            "特惠选座",
+            "特惠购票",
+            "特惠购买",
+            "特惠抢票",
+            "优惠购票",
+            "优惠购买",
+            "优惠抢票",
+            "优先购票",
+            "开抢购票",
+        ]
+
+    def _get_sku_confirm_button_texts(self):
+        """规格弹层确认/继续按钮文案候选。"""
+        return [
+            "确定",
+            "确认",
+            "确认购买",
+            "确认选择",
+            "确认并提交",
+            "下一步",
+            *self._get_purchase_button_texts(),
+        ]
+
+    def _get_listen_button_texts(self):
+        """缺货或未开售时可选的登记/提醒按钮文案。"""
+        return [
+            "缺货登记",
+            "提交缺货登记",
+            "立即登记",
+            "登记提醒",
+            "开售提醒",
+        ]
+
+    def _get_non_purchase_button_texts(self):
+        """未开售策略、提醒或营销入口，不能当作真正下单入口。"""
+        return [
+            "预约抢票",
+            "预约",
+            "抢票预约",
+            "提前选票档",
+            "抢票更丝滑",
+            "开抢提醒",
+            "开售提醒",
+            "提醒我",
+            "想看",
+            "关注",
+        ]
+
+    def _get_submit_button_texts(self):
+        """订单确认页提交/支付按钮文案候选。"""
+        return [
+            "立即提交",
+            "提交订单",
+            "确认提交",
+            "确认订单",
+            "提交并支付",
+            "确认并支付",
+            "立即支付",
+            "去支付",
+            "确认支付",
+            "支付订单",
+            "立即付款",
+            "去付款",
+            "确认下单",
+            "提交",
+            "确认",
+            "支付",
+        ]
+
+    def _looks_like_purchase_text(self, text):
+        """判断按钮文案是否像购买入口，用于兜底匹配变化文案。"""
+        if not text:
+            return False
+
+        include_keywords = ["购票", "购买", "抢票", "抢购", "预订", "订购", "选座", "下单"]
+        exclude_keywords = [
+            "缺货",
+            "售罄",
+            "无票",
+            "登记",
+            "提醒",
+            "说明",
+            "明细",
+            *self._get_non_purchase_button_texts(),
+        ]
+
+        return (
+            any(keyword in text for keyword in include_keywords) and
+            not any(keyword in text for keyword in exclude_keywords) and
+            len(text.strip()) <= 20
+        )
+
     def _is_order_confirmation_page(self):
         """检查是否为订单确认页"""
         title = self.driver.title
@@ -176,62 +319,131 @@ class Concert:
             self.select_details_page_pc()
 
         print("*******************************\n")
+        pre_start_delay = self._get_timing('pre_start_delay', 5, min_value=0)
+        if pre_start_delay > 0:
+            print(f"***等待{pre_start_delay:g}秒后开始抢票（供您手动点击「确认并知悉」）***\n")
+            time.sleep(pre_start_delay)
         print("***开始轮询检测预订按钮***\n")
 
         clicked_booking = False
+        retry_count = 0
+        max_retries = self._get_max_retries()
+
         while not self._is_order_confirmation_page():
+            if max_retries is not None and retry_count >= max_retries:
+                print(f"⚠ 已达到最大重试次数 {max_retries}，停止自动轮询，请在浏览器中手动检查当前页面。\n")
+                break
+
             if clicked_booking:
                 if self._is_order_confirmation_page():
                     print('  ✓ 页面已跳转到订单确认页\n')
+                    self.commit_order()
                     break
                 elif '选座购买' in self.driver.title:
                     print('  ✓ 页面已跳转到选座购买页\n')
                     break
+                elif 'is-seat' in self.driver.current_url or 'seat' in self.driver.current_url.lower():
+                    print('  ✓ 页面已跳转到选座页面\n')
+                    break
                 else:
+                    # 检查页面上是否已出现座位图（选座弹窗/iframe）
+                    try:
+                        seat_indicators = self.driver.find_elements(By.XPATH, "//*[contains(text(), '请选择座位') or contains(text(), '座位')]")
+                        if seat_indicators:
+                            print('  ✓ 页面已出现选座区域\n')
+                            break
+                    except Exception:
+                        pass
+
+                    if is_mobile and self._is_mobile_price_detail_visible():
+                        print('  ✓ 检测到价格明细弹窗，先关闭\n')
+                        self._click_mobile_action_button(["确定"])
+                        time.sleep(0.1)
+                        continue
+
+                    if is_mobile and self._is_mobile_sku_panel_visible():
+                        print('  ✓ 检测到移动 H5 规格弹层，继续选择场次/票档\n')
+                        self.select_details_page_mobile()
+                        if self._click_mobile_action_button(self._get_sku_confirm_button_texts()):
+                            print('  ✓ 已点击规格弹层确认按钮，等待页面跳转...\n')
+                            self._wait_after_mobile_action(max_wait=2)
+                        else:
+                            print('  ⚠ 未能点击规格弹层确认按钮，请检查票档是否已选中\n')
+                        continue
+
                     # 根据快速模式调整等待时间
-                    wait_time = 0.2 if self.config.fast_mode else 0.5
+                    wait_time = self._get_timing(
+                        'post_click_interval',
+                        0.1 if self.config.fast_mode else 0.5,
+                    )
                     time.sleep(wait_time)
+                    retry_count += 1
                     continue
 
+            action_taken = False
             try:
                 buy_button = self._get_element_text_safe('buy__button__text', By.CLASS_NAME)
                 by_link = self._get_element_text_safe('buy-link', By.CLASS_NAME)
 
-                if buy_button == "提交缺货登记":
+                if buy_button in self._get_listen_button_texts() and not self.config.if_listen:
                     self.status = 2
                     self.driver.get(self.config.target_url)
                     print('***抢票未开始，刷新等待开始***\n')
+                    retry_count += 1
                     continue
 
-                # 处理各种可点击的按钮/链接
-                clickable_actions = [
-                    ("立即预订", buy_button, 'buy__button__text'),
-                    ("立即购买", buy_button, 'buy__button__text'),
-                    ("缺货登记", buy_button, 'buy__button__text', lambda: self.config.if_listen),
-                    ("选座购买", buy_button, 'buy__button__text'),
-                ]
+                # 尝试通过 class 查找按钮（PC端）
+                if buy_button is not None:
+                    clickable_actions = [
+                        *[(text, buy_button, 'buy__button__text') for text in self._get_purchase_button_texts()],
+                        *[(text, buy_button, 'buy__button__text', lambda: self.config.if_listen) for text in self._get_listen_button_texts()],
+                    ]
+                    for action in clickable_actions:
+                        text, current_text, locator, *condition = action
+                        if current_text == text and (not condition or condition[0]()):
+                            print(f'✓ 检测到按钮: {text}')
+                            self._click_element_safe(locator, By.CLASS_NAME)
+                            self.status = 3
+                            clicked_booking = True
+                            print('  等待页面跳转...\n')
+                            action_taken = True
+                            break
 
-                action_taken = False
-                for action in clickable_actions:
-                    text, current_text, locator, *condition = action
-                    if current_text == text and (not condition or condition[0]()):
-                        print(f'✓ 检测到按钮: {text}')
-                        self._click_element_safe(locator, By.CLASS_NAME)
+                    if not action_taken and self._looks_like_purchase_text(buy_button):
+                        print(f'✓ 检测到购票按钮: {buy_button}')
+                        self._click_element_safe('buy__button__text', By.CLASS_NAME)
                         self.status = 3
                         clicked_booking = True
                         print('  等待页面跳转...\n')
                         action_taken = True
-                        break
 
-                if not action_taken and by_link in ("不，立即预订", "不，立即购买"):
-                    print(f'✓ 检测到链接: {by_link}')
-                    self._click_element_safe('buy-link', By.CLASS_NAME)
-                    self.status = 3
-                    clicked_booking = True
-                    print('  等待页面跳转...\n')
+                    if not action_taken and any(text in (by_link or "") for text in self._get_purchase_button_texts()):
+                        print(f'✓ 检测到链接: {by_link}')
+                        self._click_element_safe('buy-link', By.CLASS_NAME)
+                        self.status = 3
+                        clicked_booking = True
+                        print('  等待页面跳转...\n')
+                        action_taken = True
+
+                # 移动端备用：直接用 XPath 按文字查找按钮
+                if not action_taken:
+                    mobile_action_texts = self._get_purchase_button_texts()
+                    if self.config.if_listen:
+                        mobile_action_texts = [*mobile_action_texts, *self._get_listen_button_texts()]
+                    if self._click_mobile_action_button(mobile_action_texts):
+                        self.status = 3
+                        clicked_booking = True
+                        action_taken = True
+                        print('  等待页面跳转...\n')
 
             except Exception as e:
                 print(e)
+
+            # 如果刚点击了按钮，等待页面跳转，跳过本次检查
+            if action_taken:
+                retry_count = 0
+                self._wait_after_mobile_action(max_wait=2)
+                continue
 
             # 检查页面类型
             if '选座购买' in self.driver.title:
@@ -242,19 +454,30 @@ class Concert:
             else:
                 print('***抢票未开始，刷新等待开始***\n')
                 # 根据快速模式调整刷新等待时间
-                refresh_wait = 0.3 if self.config.fast_mode else 1
+                refresh_wait = self._get_timing(
+                    'refresh_interval',
+                    0.15 if self.config.fast_mode else 1,
+                    min_value=0.1,
+                )
                 time.sleep(refresh_wait)
                 self.driver.refresh()
+                retry_count += 1
 
     def choice_seat(self):
+        last_prompt_time = 0
         while self.driver.title == '选座购买':
             while self.is_element_exist('//*[@id="app"]/div[2]/div[2]/div[1]/div[2]/img'):
                 # 座位手动选择 选中座位之后//*[@id="app"]/div[2]/div[2]/div[1]/div[2]/img 就会消失
-                print('请快速选择您的座位！！！')
+                now = time.time()
+                if now - last_prompt_time >= 2:
+                    print('请快速选择您的座位！！！')
+                    last_prompt_time = now
+                time.sleep(0.2)
             # 消失之后就会出现 //*[@id="app"]/div[2]/div[2]/div[2]/div
             while self.is_element_exist('//*[@id="app"]/div[2]/div[2]/div[2]/div'):
                 # 找到之后进行点击确认选座
                 self.driver.find_element(value='//*[@id="app"]/div[2]/div[2]/div[2]/button', by=By.XPATH).click()
+                time.sleep(0.2)
 
     def _select_option_by_config(self, config_list, element_list, skip_keywords=None):
         """根据配置列表选择选项
@@ -718,7 +941,7 @@ class Concert:
                 try:
                     btn_text = btn.text.strip()
                     btn_class = btn.get_attribute('class') or ''
-                    if any(keyword in btn_text for keyword in ['提交订单', '提交', '确认', '立即支付', '去支付', '支付']):
+                    if any(keyword in btn_text for keyword in self._get_submit_button_texts()):
                         submit_candidates.append(('button', btn, btn_text, btn_class))
                         print(f"    [button] text='{btn_text}' class='{btn_class}'")
                 except Exception:
@@ -730,7 +953,7 @@ class Concert:
                 for elem in elements:
                     try:
                         elem_text = elem.text.strip()
-                        if elem_text in ['立即提交', '提交订单', '提交', '确认']:
+                        if elem_text in self._get_submit_button_texts():
                             elem_class = elem.get_attribute('class') or ''
                             view_name = elem.get_attribute('view-name') or ''
                             submit_candidates.append((tag, elem, elem_text, elem_class, view_name))
@@ -830,7 +1053,7 @@ class Concert:
 
         self._scan_submit_buttons()
 
-        submit_button_texts = ['立即提交', '提交订单', '提交', '确认', '立即支付', '去支付', '支付']
+        submit_button_texts = self._get_submit_button_texts()
 
         # 尝试多种方法提交
         if (self._try_submit_by_text(submit_button_texts) or
@@ -1094,6 +1317,468 @@ class Concert:
 
         if print_results:
             print(f"  ⚠ 未找到匹配的元素")
+        return False
+
+    def _find_and_click_mobile_option_card(self, search_text, max_results=10, skip_keywords=None, print_results=True):
+        """移动 H5 规格弹层：按文本查找并点击更外层的卡片容器。
+
+        大麦移动 H5 的场次/票档文字经常嵌在多层 div/span 中，直接点文本或父元素
+        不一定会触发 React 绑定在卡片上的点击事件。这里向上找一个尺寸像选项卡片
+        的祖先元素，并从卡片中心点击。
+        """
+        skip_keywords = skip_keywords or []
+
+        if self._is_mobile_option_selected(search_text, skip_keywords=skip_keywords):
+            if print_results:
+                print(f"  ✓ 移动端选项已选中，跳过重复点击: {search_text}")
+            return True
+
+        try:
+            elements = self.driver.find_elements(By.XPATH, f"//*[contains(text(), '{search_text}')]")
+        except Exception:
+            elements = []
+
+        if not elements:
+            try:
+                elements = self.driver.find_elements(By.XPATH, f"//*[contains(normalize-space(.), '{search_text}')]")
+            except Exception:
+                elements = []
+
+        if print_results:
+            print(f"  找到 {len(elements)} 个包含 '{search_text}' 的移动端候选元素")
+
+        candidates = []
+        seen = set()
+
+        for elem in elements[:max_results]:
+            try:
+                current = elem
+                for depth in range(6):
+                    elem_id = getattr(current, "id", None)
+                    if elem_id in seen:
+                        current = current.find_element(By.XPATH, '..')
+                        continue
+                    seen.add(elem_id)
+
+                    tag_name = (current.tag_name or '').lower()
+                    if tag_name in ('html', 'body'):
+                        break
+
+                    elem_text = current.text.strip()
+                    if (not elem_text or search_text not in elem_text or
+                            any(kw in elem_text for kw in skip_keywords) or
+                            len(elem_text) > 120):
+                        current = current.find_element(By.XPATH, '..')
+                        continue
+
+                    rect = self.driver.execute_script("""
+                        var r = arguments[0].getBoundingClientRect();
+                        return {width: r.width, height: r.height};
+                    """, current)
+                    width = rect.get('width', 0) if rect else 0
+                    height = rect.get('height', 0) if rect else 0
+                    area = width * height
+
+                    # 过滤掉纯文本小碎片和整个弹层/列表这种过大的容器。
+                    if width >= 20 and height >= 18 and width <= 360 and height <= 160 and 200 <= area <= 30000:
+                        candidates.append((area, depth, current, elem_text))
+
+                    current = current.find_element(By.XPATH, '..')
+            except Exception:
+                continue
+
+        # 优先点击面积更像卡片的祖先；同面积时选择更外层元素。
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+        for _, _, target, elem_text in candidates[:8]:
+            try:
+                if self._is_mobile_option_card_selected(target):
+                    if print_results:
+                        print(f"  ✓ 移动端卡片已选中: {elem_text}")
+                    return True
+
+                self.driver.execute_script("""
+                    arguments[0].scrollIntoView({block: 'center', inline: 'center'});
+                    var rect = arguments[0].getBoundingClientRect();
+                    var x = rect.left + rect.width / 2;
+                    var y = rect.top + rect.height / 2;
+                    var target = document.elementFromPoint(x, y) || arguments[0];
+                    target.click();
+                """, target)
+                time.sleep(self._get_wait_time(short=True))
+                if print_results:
+                    print(f"  ✓ 已点击移动端卡片: {elem_text}")
+                return True
+            except Exception:
+                continue
+
+        if print_results:
+            print("  ⚠ 未找到可点击的移动端卡片容器")
+        return False
+
+    def _is_mobile_option_selected(self, search_text, skip_keywords=None):
+        """检查移动 H5 规格选项是否已处于选中态。"""
+        skip_keywords = skip_keywords or []
+        try:
+            elements = self.driver.find_elements(By.XPATH, f"//*[contains(text(), '{search_text}')]")
+        except Exception:
+            return False
+
+        for elem in elements[:10]:
+            try:
+                current = elem
+                for _ in range(6):
+                    elem_text = current.text.strip()
+                    if (search_text in elem_text and
+                            not any(kw in elem_text for kw in skip_keywords) and
+                            self._is_mobile_option_card_selected(current)):
+                        return True
+                    current = current.find_element(By.XPATH, '..')
+            except Exception:
+                continue
+        return False
+
+    def _is_mobile_option_card_selected(self, element):
+        """通过 class、行内样式和计算样式判断 H5 规格卡片是否选中。"""
+        try:
+            return bool(self.driver.execute_script("""
+                var el = arguments[0];
+                for (var i = 0; el && i < 5; i++, el = el.parentElement) {
+                    var text = (el.textContent || '').trim();
+                    if (!text || text.length > 120) {
+                        continue;
+                    }
+                    var cls = (el.className || '').toString().toLowerCase();
+                    var style = (el.getAttribute('style') || '').toLowerCase();
+                    var computed = window.getComputedStyle(el);
+                    var border = [
+                        computed.borderTopColor,
+                        computed.borderRightColor,
+                        computed.borderBottomColor,
+                        computed.borderLeftColor,
+                        computed.color,
+                        computed.backgroundColor
+                    ].join('|').toLowerCase();
+
+                    if (/(active|selected|checked|current|select)/.test(cls) ||
+                        /(active|selected|checked|current|select)/.test(style) ||
+                        border.indexOf('255, 40') !== -1 ||
+                        border.indexOf('255,40') !== -1 ||
+                        border.indexOf('255, 45') !== -1 ||
+                        border.indexOf('255,45') !== -1 ||
+                        border.indexOf('#ff') !== -1) {
+                        return true;
+                    }
+                }
+                return false;
+            """, element))
+        except Exception:
+            return False
+
+    def _is_mobile_sku_panel_visible(self):
+        """判断移动 H5 的场次/票档规格弹层是否已经打开。"""
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            has_panel_text = '票档' in body_text and ('场次' in body_text or '场次时间均为演出当地时间' in body_text)
+            has_action_button = any(text in body_text for text in self._get_sku_confirm_button_texts())
+            return has_panel_text and has_action_button
+        except Exception:
+            return False
+
+    def _is_mobile_price_detail_visible(self):
+        """判断是否误打开了移动 H5 的价格明细弹窗。"""
+        try:
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            return '价格明细' in body_text and '商品信息' in body_text and '确定' in body_text
+        except Exception:
+            return False
+
+    def _wait_after_mobile_action(self, max_wait=2):
+        """点击移动 H5 操作按钮后快速等待下一状态，而不是固定 sleep。"""
+        deadline = time.time() + max_wait
+        interval = 0.05 if self.config.fast_mode else 0.1
+
+        while time.time() < deadline:
+            if self._is_order_confirmation_page():
+                self.commit_order()
+                return True
+
+            if '选座购买' in self.driver.title:
+                return True
+
+            current_url = self.driver.current_url.lower()
+            if 'is-seat' in current_url or 'seat' in current_url:
+                return True
+
+            if self._is_mobile_price_detail_visible():
+                print('  ✓ 检测到价格明细弹窗，先关闭\n')
+                self._click_mobile_action_button(["确定"])
+                return True
+
+            if self._is_mobile_sku_panel_visible():
+                print('  ✓ 检测到移动 H5 规格弹层，立即选择场次/票档\n')
+                self.select_details_page_mobile()
+                if self._click_mobile_action_button(self._get_sku_confirm_button_texts()):
+                    return True
+                return False
+
+            time.sleep(interval)
+
+        return False
+
+    def _click_mobile_action_button(self, button_texts):
+        """点击移动 H5 页面/弹层中的底部操作按钮。"""
+        for btn_text in button_texts:
+            if self._click_mobile_action_button_by_js(btn_text):
+                return True
+
+            try:
+                elements = self.driver.find_elements(
+                    By.XPATH,
+                    f"//*[contains(normalize-space(.), '{btn_text}')]"
+                )
+            except Exception:
+                elements = []
+
+            candidates = []
+            seen = set()
+
+            for elem in elements[:12]:
+                try:
+                    current = elem
+                    for depth in range(5):
+                        elem_id = getattr(current, "id", None)
+                        if elem_id in seen:
+                            current = current.find_element(By.XPATH, '..')
+                            continue
+                        seen.add(elem_id)
+
+                        tag_name = (current.tag_name or '').lower()
+                        if tag_name in ('html', 'body'):
+                            break
+                        if not current.is_displayed():
+                            current = current.find_element(By.XPATH, '..')
+                            continue
+
+                        elem_text = current.text.strip()
+                        if btn_text not in elem_text or len(elem_text) > 80:
+                            current = current.find_element(By.XPATH, '..')
+                            continue
+                        if btn_text == '确定' and elem_text != '确定':
+                            current = current.find_element(By.XPATH, '..')
+                            continue
+
+                        class_attr = current.get_attribute('class') or ''
+                        if 'disabled' in class_attr.lower():
+                            current = current.find_element(By.XPATH, '..')
+                            continue
+
+                        rect = self.driver.execute_script("""
+                            var r = arguments[0].getBoundingClientRect();
+                            return {width: r.width, height: r.height};
+                        """, current)
+                        width = rect.get('width', 0) if rect else 0
+                        height = rect.get('height', 0) if rect else 0
+                        area = width * height
+
+                        if width >= 30 and height >= 20 and width <= 1200 and height <= 140:
+                            score = area
+                            left = self.driver.execute_script("return arguments[0].getBoundingClientRect().left;", current)
+                            viewport_width = self.driver.execute_script("return window.innerWidth;")
+                            if left > viewport_width * 0.45:
+                                score += 500000
+                            if btn_text == '确定' and left < viewport_width * 0.45:
+                                score -= 500000
+                            candidates.append((score, depth, current))
+
+                        current = current.find_element(By.XPATH, '..')
+                except Exception:
+                    continue
+
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+            for _, _, target in candidates[:6]:
+                try:
+                    print(f'✓ 检测到按钮(移动端): {btn_text}')
+                    self.driver.execute_script("""
+                        arguments[0].scrollIntoView({block: 'center', inline: 'center'});
+                        var rect = arguments[0].getBoundingClientRect();
+                        var x = rect.left + rect.width / 2;
+                        var y = rect.top + rect.height / 2;
+                        var clickTarget = document.elementFromPoint(x, y) || arguments[0];
+                        clickTarget.click();
+                    """, target)
+                    time.sleep(self._get_wait_time(short=True))
+                    return True
+                except Exception:
+                    continue
+
+        return self._click_mobile_purchase_button_by_text_pattern()
+
+    def _click_mobile_action_button_by_js(self, btn_text):
+        """用 JS 从可见元素中优先点击底部大按钮。"""
+        try:
+            clicked = self.driver.execute_script("""
+                var text = arguments[0];
+                var nodes = Array.prototype.slice.call(document.querySelectorAll('button, div, span, a'));
+                var candidates = [];
+
+                function visible(el) {
+                    var style = window.getComputedStyle(el);
+                    var rect = el.getBoundingClientRect();
+                    return style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.pointerEvents !== 'none' &&
+                        rect.width > 20 &&
+                        rect.height > 18 &&
+                        rect.bottom > 0 &&
+                        rect.right > 0 &&
+                        rect.top < window.innerHeight &&
+                        rect.left < window.innerWidth;
+                }
+
+                for (var i = 0; i < nodes.length; i++) {
+                    var el = nodes[i];
+                    if (!visible(el)) {
+                        continue;
+                    }
+                    var t = (el.innerText || el.textContent || '').trim();
+                    if (!t || t.indexOf(text) === -1 || t.length > 80) {
+                        continue;
+                    }
+                    if (text === '确定' && t !== '确定') {
+                        continue;
+                    }
+                    var cls = (el.className || '').toString().toLowerCase();
+                    if (cls.indexOf('disabled') !== -1 || cls.indexOf('disable') !== -1) {
+                        continue;
+                    }
+                    var rect = el.getBoundingClientRect();
+                    var score = rect.width * rect.height;
+                    if (rect.top > window.innerHeight * 0.45) {
+                        score += 1000000;
+                    }
+                    if (rect.left > window.innerWidth * 0.45) {
+                        score += 500000;
+                    }
+                    if (text === '确定' && rect.left < window.innerWidth * 0.45) {
+                        score -= 500000;
+                    }
+                    candidates.push({el: el, score: score, top: rect.top});
+                }
+
+                candidates.sort(function(a, b) {
+                    return b.score - a.score || b.top - a.top;
+                });
+
+                if (!candidates.length) {
+                    return false;
+                }
+
+                var target = candidates[0].el;
+                target.scrollIntoView({block: 'center', inline: 'center'});
+                var rect = target.getBoundingClientRect();
+                var x = rect.left + rect.width / 2;
+                var y = rect.top + rect.height / 2;
+                var clickTarget = document.elementFromPoint(x, y) || target;
+                clickTarget.click();
+                return true;
+            """, btn_text)
+            if clicked:
+                print(f'✓ 检测到按钮(移动端): {btn_text}')
+                time.sleep(self._get_wait_time(short=True))
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _click_mobile_purchase_button_by_text_pattern(self):
+        """移动 H5 购票入口文案兜底：匹配短按钮中的购票/购买/抢票等关键词。"""
+        try:
+            clicked_text = self.driver.execute_script("""
+                var nodes = Array.prototype.slice.call(document.querySelectorAll('button, div, span, a'));
+                var include = ['购票', '购买', '抢票', '抢购', '预订', '订购', '选座', '下单'];
+                var exclude = arguments[0];
+                var candidates = [];
+
+                function visible(el) {
+                    var style = window.getComputedStyle(el);
+                    var rect = el.getBoundingClientRect();
+                    return style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.pointerEvents !== 'none' &&
+                        rect.width > 20 &&
+                        rect.height > 18 &&
+                        rect.bottom > 0 &&
+                        rect.right > 0 &&
+                        rect.top < window.innerHeight &&
+                        rect.left < window.innerWidth;
+                }
+
+                function containsAny(text, words) {
+                    for (var i = 0; i < words.length; i++) {
+                        if (text.indexOf(words[i]) !== -1) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                for (var i = 0; i < nodes.length; i++) {
+                    var el = nodes[i];
+                    if (!visible(el)) {
+                        continue;
+                    }
+                    var t = (el.innerText || el.textContent || '').trim();
+                    if (!t || t.length > 20 || !containsAny(t, include) || containsAny(t, exclude)) {
+                        continue;
+                    }
+                    var cls = (el.className || '').toString().toLowerCase();
+                    if (cls.indexOf('disabled') !== -1 || cls.indexOf('disable') !== -1) {
+                        continue;
+                    }
+                    var rect = el.getBoundingClientRect();
+                    var score = rect.width * rect.height;
+                    if (rect.top > window.innerHeight * 0.45) {
+                        score += 1000000;
+                    }
+                    if (rect.left > window.innerWidth * 0.35) {
+                        score += 250000;
+                    }
+                    candidates.push({el: el, score: score, text: t});
+                }
+
+                candidates.sort(function(a, b) {
+                    return b.score - a.score;
+                });
+
+                if (!candidates.length) {
+                    return '';
+                }
+
+                var item = candidates[0];
+                item.el.scrollIntoView({block: 'center', inline: 'center'});
+                var rect = item.el.getBoundingClientRect();
+                var x = rect.left + rect.width / 2;
+                var y = rect.top + rect.height / 2;
+                var clickTarget = document.elementFromPoint(x, y) || item.el;
+                clickTarget.click();
+                return item.text;
+            """, self._get_non_purchase_button_texts() + [
+                "缺货",
+                "售罄",
+                "无票",
+                "登记",
+                "提醒",
+                "说明",
+                "明细",
+            ])
+            if clicked_text:
+                print(f'✓ 检测到购票按钮(移动端兜底): {clicked_text}')
+                time.sleep(self._get_wait_time(short=True))
+                return True
+        except Exception:
+            pass
         return False
 
     def _scan_elements_by_class(self, class_names, label):
@@ -1506,7 +2191,17 @@ class Concert:
             if not self.config.fast_mode:
                 print(f"  搜索场次: {self.config.dates}")
             for date in self.config.dates:
-                if self._find_and_click_element(date, max_results=10, skip_keywords=['无票', '售罄'], print_results=not self.config.fast_mode):
+                if self._find_and_click_mobile_option_card(
+                    date,
+                    max_results=10,
+                    skip_keywords=['无票', '售罄'],
+                    print_results=not self.config.fast_mode
+                ) or self._find_and_click_element(
+                    date,
+                    max_results=10,
+                    skip_keywords=['无票', '售罄'],
+                    print_results=not self.config.fast_mode
+                ):
                     if not self.config.fast_mode:
                         print(f"  ✓ 已选择场次: {date}\n")
                     return True
@@ -1541,12 +2236,21 @@ class Concert:
             for price in self.config.prices:
                 if not self.config.fast_mode:
                     print(f"  尝试匹配: {price}")
-                if self._find_and_click_element(price, max_results=10,
-                                                skip_keywords=['缺货', '售罄', '无票'],
-                                                print_results=not self.config.fast_mode):
-                    if not self.config.fast_mode:
-                        print(f"  ✓ 已选择票价: {price}\n")
-                    return True
+                for price_text in self._get_price_search_texts(price):
+                    if self._find_and_click_mobile_option_card(
+                        price_text,
+                        max_results=10,
+                        skip_keywords=['缺货', '售罄', '无票'],
+                        print_results=not self.config.fast_mode
+                    ) or self._find_and_click_element(
+                        price_text,
+                        max_results=10,
+                        skip_keywords=['缺货', '售罄', '无票'],
+                        print_results=not self.config.fast_mode
+                    ):
+                        if not self.config.fast_mode:
+                            print(f"  ✓ 已选择票价: {price_text}\n")
+                        return True
 
             if not self.config.fast_mode:
                 print(f"  ⚠ 未找到匹配的票价")
@@ -1555,6 +2259,24 @@ class Concert:
             if not self.config.fast_mode:
                 print(f"  票价选择异常: {e}")
             return False
+
+    def _get_price_search_texts(self, price):
+        """从配置票价生成更宽松的移动 H5 匹配文本。"""
+        values = []
+
+        def add(value):
+            if value and value not in values:
+                values.append(value)
+
+        add(str(price).strip())
+        match = re.search(r'(\d+(?:\.\d+)?)', str(price))
+        if match:
+            amount = match.group(1)
+            add(f"{amount}元")
+            add(f"¥{amount}")
+            add(amount)
+
+        return values
 
     def select_quantity_on_page(self):
         """在页面选择数量（移动端）"""

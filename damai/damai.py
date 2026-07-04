@@ -10,13 +10,43 @@ import os
 import sys
 import time
 
-from concert import Concert
-from config import Config
+try:
+    from .concert import Concert
+    from .config import Config
+except ImportError:
+    from concert import Concert
+    from config import Config
+
+
+CONFIG_FILENAME = 'config.json'
+DEFAULT_CONFIG = {
+    'if_listen': True,
+    'if_commit_order': True,
+    'max_retries': 1000,
+    'fast_mode': True,
+    'page_load_delay': 2,
+    'pre_start_delay': 5,
+    'refresh_interval': 0.15,
+    'post_click_interval': 0.1,
+}
+
+
+def get_config_path():
+    """优先使用当前目录配置，其次使用脚本同目录配置。"""
+    cwd_config = os.path.abspath(CONFIG_FILENAME)
+    if os.path.exists(cwd_config):
+        return cwd_config
+
+    script_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)
+    if os.path.exists(script_config):
+        return script_config
+
+    return cwd_config
 
 
 def check_config_file():
     """检查配置文件是否存在和有效"""
-    config_file = 'config.json'
+    config_file = get_config_path()
 
     if not os.path.exists(config_file):
         print("=" * 50)
@@ -55,10 +85,15 @@ def check_config_file():
             print("✗ 配置文件中 users 字段不能为空")
             sys.exit(1)
 
-        print(f"✓ 配置文件加载成功")
+        if not isinstance(config['users'], list):
+            print("✗ 配置文件中 users 字段必须是数组，例如: [\"张三\", \"李四\"]")
+            sys.exit(1)
+
+        print(f"✓ 配置文件加载成功: {config_file}")
         print(f"  - 目标URL: {config['target_url']}")
         print(f"  - 观众人数: {len(config['users'])} 人")
-        print(f"  - 最大重试次数: {config.get('max_retries', 1000)} 次")
+        print(f"  - 最大重试次数: {config.get('max_retries', DEFAULT_CONFIG['max_retries'])} 次")
+        print(f"  - 刷新间隔: {config.get('refresh_interval', DEFAULT_CONFIG['refresh_interval'])} 秒")
         print()
 
     except json.JSONDecodeError as e:
@@ -70,7 +105,7 @@ def check_config_file():
 
 
 def load_config():
-    with open('config.json', 'r', encoding='utf-8') as config_file:
+    with open(get_config_path(), 'r', encoding='utf-8') as config_file:
         config = json.load(config_file)
     return Config(
         config['index_url'],
@@ -80,11 +115,14 @@ def load_config():
         config.get('city'),
         config.get('dates'),
         config.get('prices'),
-        config['if_listen'],
-        config['if_commit_order'],
-        config.get('max_retries', 1000),
-        config.get('fast_mode', True),  # 默认启用快速模式
-        config.get('page_load_delay', 2)  # 默认2秒
+        config.get('if_listen', DEFAULT_CONFIG['if_listen']),
+        config.get('if_commit_order', DEFAULT_CONFIG['if_commit_order']),
+        config.get('max_retries', DEFAULT_CONFIG['max_retries']),
+        config.get('fast_mode', DEFAULT_CONFIG['fast_mode']),  # 默认启用快速模式
+        config.get('page_load_delay', DEFAULT_CONFIG['page_load_delay']),  # 默认2秒
+        config.get('pre_start_delay', DEFAULT_CONFIG['pre_start_delay']),
+        config.get('refresh_interval', DEFAULT_CONFIG['refresh_interval']),
+        config.get('post_click_interval', DEFAULT_CONFIG['post_click_interval']),
     )
 
 
@@ -101,8 +139,9 @@ def grab():
     config = load_config()
 
     # 初始化（会自动检查 Chrome 环境）
-    con = Concert(config)
+    con = None
     try:
+        con = Concert(config)
         # 进入页面
         con.enter_concert()
         # 抢票
@@ -112,12 +151,13 @@ def grab():
         time.sleep(300)
     except KeyboardInterrupt:
         print("\n\n⚠ 用户中断程序")
-        con.finish()
     except Exception as e:
         print(f"\n✗ 运行出错: {e}")
         import traceback
         traceback.print_exc()
-        con.finish()
+    finally:
+        if con is not None:
+            con.finish()
 
 
 # exec

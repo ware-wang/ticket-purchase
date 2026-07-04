@@ -1,0 +1,20 @@
+$oldPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+$newEntries = @(
+    "C:\Users\Jian Di\AppData\Local\Programs\Python\Python39\Scripts",
+    "C:\Users\Jian Di\AppData\Local\Programs\Python\Python39",
+    "D:\Microsoft VS Code\bin"
+)
+$added = @()
+foreach ($entry in $newEntries) {
+    if ($oldPath -notmatch [regex]::Escape($entry)) {
+        $oldPath = $oldPath + ";" + $entry
+        $added += $entry
+    }
+}
+if ($added.Count -gt 0) {
+    [Environment]::SetEnvironmentVariable("PATH", $oldPath, "User")
+    Write-Host "ADDED to PATH:"
+    $added | ForEach-Object { Write-Host "  $_" }
+} else {
+    Write-Host "All paths already in PATH, no changes made."
+}
